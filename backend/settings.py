@@ -37,9 +37,10 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    # third -party apps
+    # Third-party apps
     'rest_framework',
-    # local apps
+    'django_filters',  # ← ADD THIS LINE
+    # Local apps
     'articles',
 ]
 
