@@ -3,17 +3,20 @@ Django management command to fetch articles from RSS feeds.
 
 Usage:
     python manage.py fetch_articles
+    python manage.py fetch_articles --source 1
 
 This command:
 - Fetches all active RSS sources from the database
 - Parses their RSS feeds using feedparser
 - Creates or updates articles in the database
 - Prevents duplicates based on article URL
+- Handles encoding issues gracefully
 - Logs results to console
 
 Run this command manually or schedule it with cron/celery.
 """
 import feedparser
+import requests
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from articles.models import Source, Article
@@ -54,45 +57,118 @@ class Command(BaseCommand):
         total_fetched = 0
         total_created = 0
         total_updated = 0
+        total_skipped = 0
         
         # Process each source
         for source in sources:
             self.stdout.write(f'\nFetching from: {source.name}')
+            self.stdout.write(f'  URL: {source.url}')
             
             try:
-                # Fetch and parse RSS feed
-                feed = feedparser.parse(source.url)
-                
-                # Check if feed was fetched successfully
-                if feed.bozo:
+                # Fetch RSS feed with proper encoding and error handling
+                try:
+                    response = requests.get(
+                        source.url,
+                        timeout=30,
+                        headers={
+                            'User-Agent': 'TechPulse/1.0 (RSS Reader; +https://github.com/matandasoftware/tech-pulse)'
+                        }
+                    )
+                    response.raise_for_status()
+                    
+                    # Parse the feed (feedparser handles encoding detection)
+                    feed = feedparser.parse(response.content)
+                    
+                except requests.exceptions.Timeout:
                     self.stdout.write(
-                        self.style.ERROR(f'  Error parsing feed: {feed.bozo_exception}')
+                        self.style.ERROR(f'  ✗ Timeout: Feed took too long to respond')
+                    )
+                    continue
+                    
+                except requests.exceptions.ConnectionError:
+                    self.stdout.write(
+                        self.style.ERROR(f'  ✗ Connection Error: Could not reach feed')
+                    )
+                    continue
+                    
+                except requests.exceptions.HTTPError as e:
+                    self.stdout.write(
+                        self.style.ERROR(f'  ✗ HTTP Error: {e.response.status_code}')
+                    )
+                    continue
+                    
+                except requests.exceptions.RequestException as e:
+                    self.stdout.write(
+                        self.style.ERROR(f'  ✗ Request Error: {str(e)}')
                     )
                     continue
                 
+                # Check if feed was parsed successfully
+                if feed.bozo and not feed.entries:
+                    # Only error if there are NO entries (some feeds have minor bozo warnings)
+                    self.stdout.write(
+                        self.style.ERROR(f'  ✗ Parse Error: {feed.get("bozo_exception", "Unknown error")}')
+                    )
+                    continue
+                
+                # Check if feed has entries
+                if not feed.entries:
+                    self.stdout.write(
+                        self.style.WARNING(f'  ⚠ No entries found in feed')
+                    )
+                    continue
+                
+                self.stdout.write(f'  Found {len(feed.entries)} entries')
+                
                 # Process each entry in the feed
+                entries_created = 0
+                entries_updated = 0
+                entries_skipped = 0
+                
                 for entry in feed.entries:
                     total_fetched += 1
                     
-                    # Extract article data
-                    article_data = self.extract_article_data(entry, source)
-                    
-                    # Create or update article
-                    article, created = Article.objects.update_or_create(
-                        url=article_data['url'],
-                        defaults=article_data
-                    )
-                    
-                    if created:
-                        total_created += 1
-                        self.stdout.write(
-                            self.style.SUCCESS(f'  ✓ Created: {article.title[:60]}...')
+                    try:
+                        # Extract article data
+                        article_data = self.extract_article_data(entry, source)
+                        
+                        # Skip if no URL (invalid entry)
+                        if not article_data.get('url'):
+                            entries_skipped += 1
+                            total_skipped += 1
+                            continue
+                        
+                        # Create or update article
+                        article, created = Article.objects.update_or_create(
+                            url=article_data['url'],
+                            defaults=article_data
                         )
-                    else:
-                        total_updated += 1
+                        
+                        if created:
+                            entries_created += 1
+                            total_created += 1
+                            self.stdout.write(
+                                self.style.SUCCESS(f'  ✓ Created: {article.title[:60]}...')
+                            )
+                        else:
+                            entries_updated += 1
+                            total_updated += 1
+                            self.stdout.write(
+                                self.style.WARNING(f'  ↻ Updated: {article.title[:60]}...')
+                            )
+                    
+                    except Exception as e:
+                        entries_skipped += 1
+                        total_skipped += 1
                         self.stdout.write(
-                            self.style.WARNING(f'  ↻ Updated: {article.title[:60]}...')
+                            self.style.ERROR(f'  ✗ Error processing entry: {str(e)[:50]}')
                         )
+                        continue
+                
+                # Print source summary
+                self.stdout.write(
+                    f'  Summary: {entries_created} created, {entries_updated} updated, {entries_skipped} skipped'
+                )
                 
                 # Update source last_fetched timestamp
                 source.last_fetched = timezone.now()
@@ -100,16 +176,18 @@ class Command(BaseCommand):
                 
             except Exception as e:
                 self.stdout.write(
-                    self.style.ERROR(f'  Error fetching {source.name}: {str(e)}')
+                    self.style.ERROR(f'  ✗ Unexpected error: {str(e)}')
                 )
         
-        # Print summary
-        self.stdout.write('\n' + '='*60)
-        self.stdout.write(self.style.SUCCESS(f'Fetch complete!'))
+        # Print overall summary
+        self.stdout.write('\n' + '='*70)
+        self.stdout.write(self.style.SUCCESS('Fetch complete!'))
         self.stdout.write(f'  Total entries processed: {total_fetched}')
-        self.stdout.write(self.style.SUCCESS(f'  New articles created: {total_created}'))
-        self.stdout.write(self.style.WARNING(f'  Existing articles updated: {total_updated}'))
-        self.stdout.write('='*60)
+        self.stdout.write(self.style.SUCCESS(f'  ✓ New articles created: {total_created}'))
+        self.stdout.write(self.style.WARNING(f'  ↻ Existing articles updated: {total_updated}'))
+        if total_skipped > 0:
+            self.stdout.write(self.style.ERROR(f'  ✗ Entries skipped: {total_skipped}'))
+        self.stdout.write('='*70)
 
     def extract_article_data(self, entry, source):
         """
@@ -122,57 +200,74 @@ class Command(BaseCommand):
         Returns:
             dict: Article data ready for database
         """
-        # Get title
-        title = entry.get('title', 'No Title')
+        # Get title (required)
+        title = entry.get('title', 'No Title').strip()
+        if not title:
+            title = 'Untitled Article'
         
-        # Get URL
-        url = entry.get('link', '')
+        # Get URL (required)
+        url = entry.get('link', '').strip()
         
         # Get content/summary
         content = ''
-        if hasattr(entry, 'content'):
-            content = entry.content[0].value
+        if hasattr(entry, 'content') and entry.content:
+            content = entry.content[0].get('value', '')
         elif hasattr(entry, 'description'):
             content = entry.description
         
+        # Clean up content (remove extra whitespace)
+        content = ' '.join(content.split()) if content else ''
+        
         # Get summary (shorter version)
-        summary = entry.get('summary', '')
+        summary = entry.get('summary', '').strip()
         if not summary and content:
             # Create summary from content (first 200 chars)
             summary = content[:200] + '...' if len(content) > 200 else content
         
         # Get author
-        author = entry.get('author', 'Unknown')
+        author = entry.get('author', 'Unknown').strip()
+        if not author:
+            author = 'Unknown'
         
         # Get published date
         published_at = None
         if hasattr(entry, 'published_parsed') and entry.published_parsed:
-            published_at = timezone.datetime(*entry.published_parsed[:6])
-            # Make timezone-aware
-            if timezone.is_naive(published_at):
-                published_at = timezone.make_aware(published_at)
+            try:
+                published_at = timezone.datetime(*entry.published_parsed[:6])
+                # Make timezone-aware
+                if timezone.is_naive(published_at):
+                    published_at = timezone.make_aware(published_at)
+            except (TypeError, ValueError):
+                published_at = timezone.now()
         else:
             published_at = timezone.now()
         
         # Get image URL
         image_url = None
+        
+        # Try multiple image sources
         if hasattr(entry, 'media_content') and entry.media_content:
             image_url = entry.media_content[0].get('url')
         elif hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
             image_url = entry.media_thumbnail[0].get('url')
+        elif hasattr(entry, 'enclosures') and entry.enclosures:
+            for enclosure in entry.enclosures:
+                if enclosure.get('type', '').startswith('image/'):
+                    image_url = enclosure.get('href')
+                    break
         
         # Default category (you can make this smarter later)
         category = source.category if hasattr(source, 'category') else None
         
         return {
-            'title': title,
-            'url': url,
+            'title': title[:500],  # Limit title length
+            'url': url[:500],      # Limit URL length
             'content': content,
-            'summary': summary,
-            'author': author,
+            'summary': summary[:1000] if summary else '',  # Limit summary length
+            'author': author[:200],  # Limit author length
             'source': source,
             'category': category,
             'published_at': published_at,
-            'image_url': image_url,
+            'image_url': image_url[:500] if image_url else None,  # Limit URL length
             'fetched_at': timezone.now(),
         }
