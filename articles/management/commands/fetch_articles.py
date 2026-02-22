@@ -189,14 +189,75 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR(f'  ✗ Entries skipped: {total_skipped}'))
         self.stdout.write('='*70)
 
+    def detect_category(self, title, content, summary):
+        """
+        Auto-detect article category based on keywords in title and content.
+
+        Args:
+            title: Article title
+            content: Article content
+            summary: Article summary
+
+        Returns:
+            Category object or None
+        """
+        from articles.models import Category
+
+        # Combine all text for keyword matching (lowercase)
+        text = f"{title} {content} {summary}".lower()
+
+        # Define keyword mappings for categories (matching DB category names)
+        category_keywords = {
+            'Artificial Intelligence': ['artificial intelligence', 'machine learning', 'deep learning', 
+                                        'neural network', 'ai', 'gpt', 'chatgpt', 'llm', 'openai', 
+                                        'generative', 'cognitive computing', 'ml', 'ai model'],
+            'Startups': ['startup', 'startups', 'funding', 'venture capital', 'vc', 'seed round',
+                         'series a', 'series b', 'entrepreneur', 'entrepreneurship', 'founder',
+                         'unicorn', 'investment', 'investors'],
+            'Mobile': ['mobile', 'android', 'ios', 'swift', 'kotlin', 'flutter', 'react native', 
+                       'mobile app', 'smartphone', 'iphone', 'samsung', 'app store', 'play store'],
+            'Security': ['security', 'cybersecurity', 'hack', 'breach', 'vulnerability', 
+                         'encryption', 'malware', 'ransomware', 'firewall', 'privacy', 
+                         'data breach', 'cyber attack', 'phishing'],
+            'Business': ['business', 'corporate', 'economics', 'finance', 'strategy', 'merger',
+                         'acquisition', 'ceo', 'revenue', 'profit', 'market', 'commerce',
+                         'enterprise', 'management'],
+            'Science': ['science', 'scientific', 'research', 'space', 'physics', 'biology',
+                        'chemistry', 'astronomy', 'nasa', 'laboratory', 'study', 'experiment',
+                        'discovery', 'quantum'],
+            'Software': ['software', 'programming', 'developer', 'coding', 'code', 'framework',
+                         'library', 'api', 'web development', 'frontend', 'backend', 'javascript',
+                         'python', 'java', 'devops', 'ci/cd', 'github', 'open source'],
+            'Technology': ['technology', 'tech', 'innovation', 'digital', 'gadget', 'device',
+                          'electronics', 'hardware', 'computing', 'internet', 'web', 'online',
+                          'platform', 'service', 'product', 'launch', 'release', 'announcement'],
+        }
+        # Score each category based on keyword matches
+        scores = {}
+        for category_name, keywords in category_keywords.items():
+            score = sum(1 for keyword in keywords if keyword in text)
+            if score > 0:
+                scores[category_name] = score
+
+        # If we found matching keywords, return the highest scoring category
+        if scores:
+            best_category_name = max(scores, key=scores.get)
+            try:
+                return Category.objects.get(name=best_category_name)
+            except Category.DoesNotExist:
+                pass
+
+        # Return None if no category matches
+        return None
+
     def extract_article_data(self, entry, source):
         """
         Extract article data from RSS feed entry.
-        
+
         Args:
             entry: feedparser entry object
             source: Source model instance
-            
+
         Returns:
             dict: Article data ready for database
         """
@@ -259,15 +320,18 @@ class Command(BaseCommand):
         # Default category (you can make this smarter later)
         category = source.category if hasattr(source, 'category') else None
         
+                # Auto-assign category based on keywords
+        category = self.detect_category(title, content, summary)
+        
         return {
-            'title': title[:500],  # Limit title length
-            'url': url[:500],      # Limit URL length
+            'title': title[:500],
+            'url': url[:500],
             'content': content,
-            'summary': summary[:1000] if summary else '',  # Limit summary length
-            'author': author[:200],  # Limit author length
+            'summary': summary[:1000] if summary else '',
+            'author': author[:200],
             'source': source,
-            'category': category,
+            'category': category,  # ← Now auto-detected!
             'published_at': published_at,
-            'image_url': image_url[:500] if image_url else None,  # Limit URL length
+            'image_url': image_url[:500] if image_url else None,
             'fetched_at': timezone.now(),
         }
